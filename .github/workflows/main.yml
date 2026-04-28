@@ -1,0 +1,209 @@
+# ============================================================
+#  CI Pipeline — bitfive monorepo
+#  Backend : /api  (TypeScript / Node.js)
+#  Frontend: /app  (JavaScript)
+#
+#  Jobs
+#  ├── lint    → matrix: [api, app]  type-check / lint
+#  ├── build   → matrix: [api, app]  depende de lint
+#  └── semgrep → SAST con política según rama (Gitflow)
+#
+#  Política Semgrep
+#  ├── PR → develop   : baseline scan  (solo findings nuevos, no bloquea)
+#  ├── push develop   : full scan      (visible en Security tab)
+#  ├── PR → main      : full scan estricto (bloquea si hay ERROR)
+#  └── push main / release/* / hotfix/* : full scan estricto (bloquea)
+# ============================================================
+
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+      - "release/*"
+      - "hotfix/*"
+  pull_request:
+    branches:
+      - main
+      - develop
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# ── Variables compartidas por todos los jobs ───────────────
+env:
+  NODE_VERSION: 20
+
+jobs:
+  # ----------------------------------------------------------
+  # 1. LINT — matrix [api, app]
+  # ----------------------------------------------------------
+  lint:
+    name: "Lint · ${{ matrix.name }}"
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false   # si falla uno, el otro sigue corriendo
+      matrix:
+        include:
+          - name: backend
+            path: api
+            lang: typescript
+
+          - name: frontend
+            path: app
+            lang: javascript
+
+    defaults:
+      run:
+        working-directory: ${{ matrix.path }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: ${{ matrix.path }}/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      # Solo en el backend (TypeScript) → type-check
+      - name: TypeScript type-check
+        if: matrix.lang == 'typescript'
+        run: npx tsc --noEmit
+
+      # Solo en el frontend (JavaScript) → lint
+      - name: ESLint
+        if: matrix.lang == 'javascript'
+        run: npm run lint --if-present
+
+  # ----------------------------------------------------------
+  # 2. BUILD — matrix [api, app]
+  # ----------------------------------------------------------
+  build:
+    name: "Build · ${{ matrix.name }}"
+    runs-on: ubuntu-latest
+    needs: lint   # espera a que ambos lints pasen
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: backend
+            path: api
+            artifact: backend-dist
+            dist: api/dist      # ajusta si tu carpeta de salida es diferente
+
+          - name: frontend
+            path: app
+            artifact: frontend-dist
+            dist: app/dist      # ajusta si tu carpeta de salida es diferente (build/, out/, etc.)
+
+    defaults:
+      run:
+        working-directory: ${{ matrix.path }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: ${{ matrix.path }}/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.dist }}
+          retention-days: 3
+          # ↑ GitHub borra el artefacto automáticamente después de 3 días.
+          #   El default es 90 días. Para builds de CI que solo verifican
+          #   que el código compila, 3 días es más que suficiente.
+
+  # ----------------------------------------------------------
+  # 3. SEMGREP SAST — Análisis de seguridad estático
+  # ----------------------------------------------------------
+  semgrep:
+    name: "SAST · Semgrep"
+    runs-on: ubuntu-latest
+    needs: build
+    if: always()
+    container:
+      image: returntocorp/semgrep
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # necesario para el baseline scan
+
+      # ── Calcular política según rama/evento ───────────────
+      - name: Determinar política según rama
+        id: policy
+        run: |
+          STRICT="false"
+          BASELINE=""
+
+          # PR hacia main → estricto
+          if [ "${{ github.event_name }}" = "pull_request" ] \
+          && [ "${{ github.base_ref }}" = "main" ]; then
+            STRICT="true"
+          fi
+
+          # Push directo a main / release/* / hotfix/* → estricto
+          if [ "${{ github.ref }}" = "refs/heads/main" ] \
+          || echo "${{ github.ref }}" | grep -qE '^refs/heads/release/|^refs/heads/hotfix/'; then
+            STRICT="true"
+          fi
+
+          # PR hacia develop → baseline (solo findings nuevos)
+          if [ "${{ github.event_name }}" = "pull_request" ] \
+          && [ "${{ github.base_ref }}" = "develop" ]; then
+            BASELINE="--baseline-ref=origin/develop"
+          fi
+
+          echo "strict=$STRICT"     >> $GITHUB_OUTPUT
+          echo "baseline=$BASELINE" >> $GITHUB_OUTPUT
+
+      # ── Ejecutar Semgrep ──────────────────────────────────
+      - name: Ejecutar Semgrep
+        run: |
+          STRICT_FLAGS=""
+          if [ "${{ steps.policy.outputs.strict }}" = "true" ]; then
+            STRICT_FLAGS="--error --severity=ERROR"
+          fi
+
+          semgrep scan \
+            --config=p/ci \
+            --config=p/javascript \
+            --config=p/typescript \
+            --config=p/secrets \
+            ${{ steps.policy.outputs.baseline }} \
+            $STRICT_FLAGS \
+            --sarif --output=results.sarif \
+            ./api ./app
+
+      # ── Publicar reporte en Security tab ─────────────────
+      - name: Publicar SARIF en Security tab
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: results.sarif
